@@ -17,10 +17,17 @@ typedef unsigned int uintptr_t;
 #define MULTIBOOT_TAG_TYPE_END 0
 #define MULTIBOOT_TAG_TYPE_FRAMEBUFFER 8
 
+/*
+ * These structs are laid directly over memory that GRUB fills in, byte for
+ * byte, according to the Multiboot2 spec. Without __attribute__((packed))
+ * the compiler is free to insert padding (in particular before the 64-bit
+ * framebuffer_addr field, depending on target/ABI), which would silently
+ * misread every field after it. Packing removes that risk.
+ */
 typedef struct {
     uint32_t type;
     uint32_t size;
-} multiboot_tag_t;
+} __attribute__((packed)) multiboot_tag_t;
 
 typedef struct {
     uint32_t type;
@@ -32,7 +39,7 @@ typedef struct {
     uint8_t framebuffer_bpp;
     uint8_t framebuffer_type;
     uint16_t reserved;
-} multiboot_tag_framebuffer_common_t;
+} __attribute__((packed)) multiboot_tag_framebuffer_common_t;
 
 typedef struct {
     uint32_t type;
@@ -50,7 +57,7 @@ typedef struct {
     uint8_t green_mask_size;
     uint8_t blue_position;
     uint8_t blue_mask_size;
-} multiboot_tag_framebuffer_rgb_t;
+} __attribute__((packed)) multiboot_tag_framebuffer_rgb_t;
 
 typedef struct {
     uint8_t *address;
@@ -64,6 +71,20 @@ typedef struct {
 } screen_t;
 
 static screen_t screen;
+
+static void vga_message(const char *message) {
+    volatile uint16_t *video = (volatile uint16_t *)0xb8000;
+    uint32_t position = 0;
+
+    while (*message != '\0' && position < 80u * 25u) {
+        if (*message == '\n') {
+            position = ((position / 80u) + 1u) * 80u;
+        } else {
+            video[position++] = (uint16_t)(0x4fu << 8) | (uint8_t)*message;
+        }
+        message++;
+    }
+}
 
 static uint32_t rgb(uint8_t red, uint8_t green, uint8_t blue) {
     return ((uint32_t)red << screen.red_position) |
@@ -199,16 +220,33 @@ static void draw_desktop(void) {
 }
 
 static int find_framebuffer(uint32_t info_address) {
+    if (info_address == 0) {
+        return 0;
+    }
+
     uint32_t total_size = *(uint32_t *)info_address;
     uint32_t offset = 8;
 
     while (offset < total_size) {
         multiboot_tag_t *tag = (multiboot_tag_t *)(info_address + offset);
+        if (tag->size < 8) {
+            return 0;
+        }
+
+        if (tag->type == MULTIBOOT_TAG_TYPE_END) {
+            break;
+        }
+
         if (tag->type == MULTIBOOT_TAG_TYPE_FRAMEBUFFER) {
             multiboot_tag_framebuffer_rgb_t *framebuffer =
                 (multiboot_tag_framebuffer_rgb_t *)tag;
-            if (framebuffer->framebuffer_type != 1 ||
-                framebuffer->framebuffer_bpp != 32) {
+            if (tag->size < 38u ||
+                framebuffer->framebuffer_type != 1 ||
+                framebuffer->framebuffer_bpp != 32 ||
+                framebuffer->framebuffer_addr == 0 ||
+                framebuffer->framebuffer_pitch == 0 ||
+                framebuffer->framebuffer_width == 0 ||
+                framebuffer->framebuffer_height == 0) {
                 return 0;
             }
 
@@ -230,11 +268,14 @@ static int find_framebuffer(uint32_t info_address) {
 }
 
 void kernel_main(uint32_t magic, uint32_t info_address) {
-    if (magic != MULTIBOOT2_BOOTLOADER_MAGIC ||
-        !find_framebuffer(info_address)) {
-        for (;;) {
-            __asm__ volatile ("hlt");
-        }
+    if (magic != MULTIBOOT2_BOOTLOADER_MAGIC) {
+        vga_message("BOOT ERROR: INVALID MULTIBOOT2 MAGIC");
+        return;
+    }
+
+    if (!find_framebuffer(info_address)) {
+        vga_message("BOOT ERROR: NO 32-BIT FRAMEBUFFER");
+        return;
     }
 
     draw_desktop();
